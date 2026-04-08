@@ -9,7 +9,9 @@ const NearbyMap = dynamic(() => import("@/components/sections/NearbyMap"), {
   ssr: false,
 });
 
-const RADIUS_OPTIONS = [500, 1000, 2000, 5000] as const;
+const DEFAULT_RADIUS_METERS = 5000;
+const RADIUS_OPTIONS = [5000, 10000, 15000, 20000, 30000] as const;
+const AUTO_EXPAND_BASE_STEPS = [5000, 10000, 15000, 20000, 30000];
 
 type NominatimResult = {
   place_id: number;
@@ -49,7 +51,8 @@ function getBoundingBox(location: UserLocation, radiusMeters: number): string {
 
 export default function NearbySearchSection() {
   const [query, setQuery] = useState("salon");
-  const [radiusMeters, setRadiusMeters] = useState<number>(1000);
+  const [radiusMeters, setRadiusMeters] = useState<number>(DEFAULT_RADIUS_METERS);
+  const [customRadiusKm, setCustomRadiusKm] = useState<string>("5");
   const [userLocation, setUserLocation] = useState<UserLocation | null>(null);
   const [places, setPlaces] = useState<Place[]>([]);
   const [selectedPlaceId, setSelectedPlaceId] = useState<string | null>(null);
@@ -80,6 +83,69 @@ export default function NearbySearchSection() {
       );
     });
 
+  const fetchNearbyWithinRadius = async (
+    term: string,
+    location: UserLocation,
+    selectedRadius: number
+  ): Promise<Place[]> => {
+    const viewbox = getBoundingBox(location, selectedRadius);
+    const response = await fetch(
+      `https://nominatim.openstreetmap.org/search?` +
+        new URLSearchParams({
+          q: term,
+          format: "json",
+          limit: "50",
+          addressdetails: "1",
+          bounded: "1",
+          viewbox,
+        }).toString()
+    );
+
+    if (!response.ok) {
+      throw new Error("Search failed. Please try again.");
+    }
+
+    const raw = (await response.json()) as NominatimResult[];
+    return raw
+      .map((item) => parsePlace(item, location))
+      .filter((item) => item.distanceMeters <= selectedRadius)
+      .sort((a, b) => a.distanceMeters - b.distanceMeters);
+  };
+
+  const fetchGlobalMatches = async (term: string, location: UserLocation): Promise<Place[]> => {
+    const response = await fetch(
+      `https://nominatim.openstreetmap.org/search?` +
+        new URLSearchParams({
+          q: term,
+          format: "json",
+          limit: "50",
+          addressdetails: "1",
+        }).toString()
+    );
+
+    if (!response.ok) {
+      throw new Error("Search failed. Please try again.");
+    }
+
+    const raw = (await response.json()) as NominatimResult[];
+    return raw
+      .map((item) => parsePlace(item, location))
+      .sort((a, b) => a.distanceMeters - b.distanceMeters);
+  };
+
+  const getExpandedRadiusSequence = (startRadius: number): number[] => {
+    const sequence = new Set<number>([startRadius, ...AUTO_EXPAND_BASE_STEPS]);
+    let nextRadius = 40000;
+
+    // No fixed upper limit in UX; this keeps requesting wider ranges progressively.
+    while (sequence.size < 18) {
+      sequence.add(nextRadius);
+      nextRadius += 20000;
+    }
+
+    return [...sequence].sort((a, b) => a - b).filter((value) => value >= startRadius);
+  };
+
   const runSearch = async (term: string, selectedRadius: number) => {
     if (!term.trim()) return;
 
@@ -89,39 +155,40 @@ export default function NearbySearchSection() {
     try {
       const location = await requestCurrentLocation();
       setUserLocation(location);
+      const expandedRadii = getExpandedRadiusSequence(selectedRadius);
+      let foundPlaces: Place[] = [];
+      let matchedRadius = selectedRadius;
 
-      setStatus(`Searching nearby "${term}"...`);
-      const viewbox = getBoundingBox(location, selectedRadius);
-
-      const response = await fetch(
-        `https://nominatim.openstreetmap.org/search?` +
-          new URLSearchParams({
-            q: term,
-            format: "json",
-            limit: "40",
-            addressdetails: "1",
-            bounded: "1",
-            viewbox,
-          }).toString()
-      );
-
-      if (!response.ok) {
-        throw new Error("Search failed. Please try again.");
+      for (const radius of expandedRadii) {
+        setStatus(`Searching "${term}" within ${formatDistance(radius)}...`);
+        const currentResults = await fetchNearbyWithinRadius(term, location, radius);
+        if (currentResults.length > 0) {
+          foundPlaces = currentResults;
+          matchedRadius = radius;
+          break;
+        }
       }
 
-      const raw = (await response.json()) as NominatimResult[];
+      if (foundPlaces.length === 0) {
+        setStatus(`Expanding search globally for "${term}"...`);
+        foundPlaces = await fetchGlobalMatches(term, location);
+      }
 
-      const nearbyPlaces = raw
-        .map((item) => parsePlace(item, location))
-        .filter((item) => item.distanceMeters <= selectedRadius)
-        .sort((a, b) => a.distanceMeters - b.distanceMeters);
+      const uniqueById = new Map(foundPlaces.map((place) => [place.id, place]));
+      const sortedPlaces = [...uniqueById.values()].sort(
+        (a, b) => a.distanceMeters - b.distanceMeters
+      );
 
-      setPlaces(nearbyPlaces);
-      setSelectedPlaceId(nearbyPlaces[0]?.id ?? null);
+      if (sortedPlaces.length > 0) {
+        setRadiusMeters(Math.max(selectedRadius, matchedRadius));
+      }
+
+      setPlaces(sortedPlaces);
+      setSelectedPlaceId(sortedPlaces[0]?.id ?? null);
       setStatus(
-        nearbyPlaces.length > 0
-          ? `${nearbyPlaces.length} nearby result(s) found.`
-          : `No nearby results for "${term}" in this radius.`
+        sortedPlaces.length > 0
+          ? `${sortedPlaces.length} result(s) found. Nearest first by distance.`
+          : `No matching data available for "${term}".`
       );
     } catch (error) {
       const message = error instanceof Error ? error.message : "Something went wrong.";
@@ -164,9 +231,26 @@ export default function NearbySearchSection() {
               if (userLocation) void runSearch(query, value);
             }}
           >
-            {value < 1000 ? `${value} m` : `${value / 1000} km`}
+            {value / 1000} km
           </button>
         ))}
+        <label className="radius-custom">
+          <span>Custom km</span>
+          <input
+            type="number"
+            min="1"
+            step="1"
+            value={customRadiusKm}
+            onChange={(event) => setCustomRadiusKm(event.target.value)}
+            onBlur={() => {
+              const parsedKm = Number(customRadiusKm);
+              if (!Number.isFinite(parsedKm) || parsedKm <= 0) return;
+              const customMeters = Math.round(parsedKm * 1000);
+              setRadiusMeters(customMeters);
+              if (userLocation) void runSearch(query, customMeters);
+            }}
+          />
+        </label>
       </div>
 
       <div className="content-grid">
